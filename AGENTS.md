@@ -91,19 +91,12 @@ that one is broken by a _runtime_ import, this one by a _type_ re-export.
 [`src/__testing__/publishedTypeSurfaceDependencies.test.ts`](src/__testing__/publishedTypeSurfaceDependencies.test.ts)
 is the guard. It reads the built `dist/index.d.ts` (CI's `node-checks.yml` runs `make build` before
 `make tests`, so it is present; a local `jest` with no build skips, and skipping is itself a failure
-when `CI` is set). It also owns the exemption list: `@reduxjs/toolkit` and `redux` still leak from
-`src/actors/*` and `src/redux-persist/*`, and today resolve for consumers only because
-`@meshery/schemas` declares `@reduxjs/toolkit` and `react-redux` as required peers - transitive luck,
-not a contract. Neither a plain dependency nor a required peer is right for them (see the rationale
-in that file); the remedy is a separate opt-in entry point for the redux-facing surface.
-
-It owns a second, separate list for the optional-peer case, which needs a different remedy: the
-package _is_ declared, just optional. `@mui/x-date-pickers` is on it because the barrel does
-`export { DateTimePickerProps } from '@mui/x-date-pickers/DateTimePicker'`, so a consumer who skips
-that optional peer silently gets `any` for the props type. Exempted on the record; the fix is to
-stop re-exporting it, tracked in [#1749](https://github.com/layer5io/sistent/issues/1749). `react`
-is on it too, for the same reason it is exempted in the runtime guard - it is optional in name only
-for a React component library.
+when `CI` is set). It is also the source of truth for the two exemption lists and the per-package
+rationale behind each: packages that leak _undeclared_ (today the redux-facing surface reached
+through `src/actors/*` and `src/redux-persist/*`, whose remedy is its own opt-in entry point, not a
+dependency), and packages that _are_ declared but only as optional peers, whose remedy is to stop
+naming them in the public type surface. Every entry is asserted to still be needed, so it cannot
+outlive its problem - read that file, not a copy here, before touching either list.
 
 ## Permission keys are owned by `meshery/schemas`, not by sistent
 
