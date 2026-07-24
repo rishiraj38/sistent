@@ -22,8 +22,10 @@
  * reach production unnoticed.
  *
  * The rule this pins: a package named by the published declaration bundle must
- * be a real `dependency` or `peerDependency`. `devDependencies` are not part of
- * what a consumer installs and cannot carry a public type.
+ * be a real `dependency` or a *non-optional* `peerDependency`. Neither a
+ * `devDependency` nor a peer marked optional in `peerDependenciesMeta` is part
+ * of what a consumer necessarily installs, so neither can carry a public type -
+ * an optional peer that is skipped fails in exactly the two ways above.
  */
 import fs from 'fs';
 import { builtinModules } from 'module';
@@ -50,6 +52,29 @@ const DTS = path.join(ROOT, 'dist', 'index.d.ts');
  * moment a *new* package starts leaking.
  */
 const UNDECLARED_BY_DESIGN = ['@reduxjs/toolkit', 'redux'];
+
+/**
+ * Packages the declaration bundle names that *are* declared, but only as peers
+ * marked optional - so a consumer is entitled to install neither, and the type
+ * reference then breaks the same two ways as an undeclared package: `TS2307`
+ * under `skipLibCheck: false`, a silent `any` under `skipLibCheck: true`.
+ *
+ * Kept separate from `UNDECLARED_BY_DESIGN` because the remedy differs: those
+ * are missing from `package.json` entirely, these are present and merely
+ * optional, and the fix is to stop naming them in the public type surface.
+ *
+ * - `@mui/x-date-pickers`: a live defect, not a design choice. The barrel does
+ *   `export { DateTimePickerProps } from '@mui/x-date-pickers/DateTimePicker'`,
+ *   so a consumer who skips the optional peer silently gets `any` for it. The
+ *   real fix is to stop re-exporting that props type from the barrel, tracked in
+ *   https://github.com/layer5io/sistent/issues/1749 - exempted here on the
+ *   record so this guard can ship without also making a public-API change.
+ * - `react`: optional in `package.json`, but every component's props type names
+ *   it and always will, and a consumer of a React component library has React.
+ *   Same rationale as the `react` / `react-dom` exemption in the sibling
+ *   `optionalPeerDependencies.test.ts`.
+ */
+const OPTIONAL_PEERS_ON_THE_RECORD = ['@mui/x-date-pickers', 'react'];
 
 /**
  * JSDoc in the bundle carries fenced `@example` blocks with real-looking import
@@ -83,17 +108,40 @@ const externalPackagesIn = (source: string): string[] =>
     .filter((name) => !builtinModules.includes(name))
     .sort();
 
-describe('the published type surface only names packages a consumer installs', () => {
-  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as {
-    dependencies?: Record<string, string>;
-    peerDependencies?: Record<string, string>;
-    devDependencies?: Record<string, string>;
-  };
+type PackageJson = {
+  dependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+  peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+  devDependencies?: Record<string, string>;
+};
 
-  const installedByConsumers = [
+const optionalPeersOf = (pkg: PackageJson): string[] =>
+  Object.entries(pkg.peerDependenciesMeta ?? {})
+    .filter(([, meta]) => meta?.optional)
+    .map(([name]) => name);
+
+/**
+ * What a consumer is *guaranteed* to have: dependencies, plus the peers npm
+ * installs for them - which excludes every peer marked optional.
+ *
+ * Read from `peerDependenciesMeta` rather than a hardcoded list, so marking a
+ * new peer optional immediately tightens this guard instead of leaving a hole
+ * that only shows up in a downstream install.
+ */
+const installedByConsumersOf = (pkg: PackageJson): string[] => {
+  const optional = optionalPeersOf(pkg);
+
+  return [
     ...Object.keys(pkg.dependencies ?? {}),
     ...Object.keys(pkg.peerDependencies ?? {})
-  ];
+  ].filter((name) => !optional.includes(name));
+};
+
+describe('the published type surface only names packages a consumer installs', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as PackageJson;
+
+  const installedByConsumers = installedByConsumersOf(pkg);
+  const optionalPeers = optionalPeersOf(pkg);
 
   const built = fs.existsSync(DTS);
 
@@ -119,14 +167,16 @@ describe('the published type surface only names packages a consumer installs', (
       expect(referenced.length).toBeGreaterThan(5);
     });
 
-    it('names no package that is missing from dependencies and peerDependencies', () => {
+    it('names no package that a consumer might not have installed', () => {
+      const exempt = [...UNDECLARED_BY_DESIGN, ...OPTIONAL_PEERS_ON_THE_RECORD];
+
       const undeclared = referenced.filter(
-        (name) => !installedByConsumers.includes(name) && !UNDECLARED_BY_DESIGN.includes(name)
+        (name) => !installedByConsumers.includes(name) && !exempt.includes(name)
       );
 
       // Listing names rather than asserting a count: on failure the message is
-      // the remediation - move each one out of devDependencies, or stop
-      // re-exporting its types from the barrel.
+      // the remediation - move each one out of devDependencies (or out of
+      // optional), or stop re-exporting its types from the barrel.
       expect(undeclared).toEqual([]);
     });
 
@@ -145,6 +195,17 @@ describe('the published type surface only names packages a consumer installs', (
         // Without this the exemption list would outlive the problem and start
         // hiding a genuine regression under a stale entry.
         expect(referenced).toContain(name);
+      }
+    );
+
+    it.each(OPTIONAL_PEERS_ON_THE_RECORD)(
+      'still needs its %s optional-peer exemption - delete it here once resolved',
+      (name) => {
+        // Two ways the entry can go stale, and both have to fail loudly: the
+        // type surface stops naming it (#1749 lands), or the peer stops being
+        // optional - either way the exemption is hiding nothing and must go.
+        expect(referenced).toContain(name);
+        expect(optionalPeers).toContain(name);
       }
     );
   });
@@ -173,6 +234,45 @@ describe('the published type surface only names packages a consumer installs', (
       ].join('\n');
 
       expect(externalPackagesIn(source)).toEqual(['@meshery/schemas']);
+    });
+
+    // The other half of the comparison, and the one that was wrong first: the
+    // scan can name every external package correctly and still pass a leak
+    // through if the set it is checked against overstates what a consumer has.
+    describe('what counts as installed by a consumer', () => {
+      const pkg: PackageJson = {
+        dependencies: { rxjs: '^7.8.2' },
+        peerDependencies: { '@mui/material': '^9.0.0', '@mui/x-date-pickers': '^9.0.0' },
+        peerDependenciesMeta: { '@mui/x-date-pickers': { optional: true } },
+        devDependencies: { typescript: '^6.0.3' }
+      };
+
+      it('counts dependencies and required peers', () => {
+        expect(installedByConsumersOf(pkg)).toEqual(['rxjs', '@mui/material']);
+      });
+
+      it('does not count a peer marked optional - a consumer may skip it', () => {
+        expect(installedByConsumersOf(pkg)).not.toContain('@mui/x-date-pickers');
+      });
+
+      it('does not count a devDependency', () => {
+        expect(installedByConsumersOf(pkg)).not.toContain('typescript');
+      });
+
+      it('treats a peer with no meta entry as required', () => {
+        expect(installedByConsumersOf({ peerDependencies: { react: '^19.0.0' } })).toEqual([
+          'react'
+        ]);
+      });
+
+      it('treats optional: false as required rather than as merely present', () => {
+        const explicit: PackageJson = {
+          peerDependencies: { react: '^19.0.0' },
+          peerDependenciesMeta: { react: { optional: false } }
+        };
+
+        expect(installedByConsumersOf(explicit)).toEqual(['react']);
+      });
     });
   });
 });

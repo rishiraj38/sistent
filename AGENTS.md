@@ -81,8 +81,10 @@ The silent case is the one that bites. `Key` is the permission-key contract behi
 on Button/IconButton/MenuItem/ListItem/ListItemButton, `PermissionShield`, `PermissionProvider` and
 `useHasPermission`; when it collapses to `any` those props stop being checked and nothing reports it.
 
-So: **if a package's types reach `dist/index.d.ts`, it must be a `dependency` or `peerDependency`.**
-Bundling the runtime does not discharge that - only the type reference matters here. This is the
+So: **if a package's types reach `dist/index.d.ts`, it must be a `dependency` or a _non-optional_
+`peerDependency`.** A peer marked optional in `peerDependenciesMeta` does not discharge it either -
+a consumer is entitled to skip that peer, and the reference then fails the same two ways. Bundling
+the runtime does not discharge it either; only the type reference matters here. This is the
 declaration-side twin of the optional-peer rule above, and the two fail in opposite directions:
 that one is broken by a _runtime_ import, this one by a _type_ re-export.
 
@@ -95,9 +97,13 @@ when `CI` is set). It also owns the exemption list: `@reduxjs/toolkit` and `redu
 not a contract. Neither a plain dependency nor a required peer is right for them (see the rationale
 in that file); the remedy is a separate opt-in entry point for the redux-facing surface.
 
-Related known gap, harmless under `skipLibCheck: true` and untouched: `dist/index.d.ts` names
-`@reduxjs/toolkit/dist/query/react`, an internal path that does not resolve through RTK 2.x's
-`exports` map - `rollup-plugin-dts` rewrote the source's correct `@reduxjs/toolkit/query/react`.
+It owns a second, separate list for the optional-peer case, which needs a different remedy: the
+package _is_ declared, just optional. `@mui/x-date-pickers` is on it because the barrel does
+`export { DateTimePickerProps } from '@mui/x-date-pickers/DateTimePicker'`, so a consumer who skips
+that optional peer silently gets `any` for the props type. Exempted on the record; the fix is to
+stop re-exporting it, tracked in [#1749](https://github.com/layer5io/sistent/issues/1749). `react`
+is on it too, for the same reason it is exempted in the runtime guard - it is optional in name only
+for a React component library.
 
 ## Permission keys are owned by `meshery/schemas`, not by sistent
 
