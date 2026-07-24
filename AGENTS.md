@@ -66,6 +66,58 @@ Keep that peer list in step with the enforced set in the test above. Use the
 Known live instance: [#1735](https://github.com/layer5io/sistent/issues/1735) (`date-fns` in
 `src/custom/UniversalFilter.tsx`).
 
+## A type in the public API needs a real dependency, not a devDependency
+
+The runtime bundle and the declaration bundle disagree about externals. `tsup` inlines
+`@meshery/schemas` (`noExternal` in `tsup.config.ts`), but `rollup-plugin-dts` still emits
+`export { Key } from '@meshery/schemas/permissions'` into `dist/index.d.ts`. A `devDependency`
+satisfies that reference inside this repo and nowhere else, so the package builds green here and
+then, for a consumer who did not install the package independently:
+
+- `skipLibCheck: false` -> `TS2307: Cannot find module`, pointing at sistent's own `.d.ts`;
+- `skipLibCheck: true` (the common default) -> the re-exported type **silently becomes `any`**.
+
+The silent case is the one that bites. `Key` is the permission-key contract behind `permissionKey`
+on Button/IconButton/MenuItem/ListItem/ListItemButton, `PermissionShield`, `PermissionProvider` and
+`useHasPermission`; when it collapses to `any` those props stop being checked and nothing reports it.
+
+So: **if a package's types reach `dist/index.d.ts`, it must be a `dependency` or a _non-optional_
+`peerDependency`.** A peer marked optional in `peerDependenciesMeta` does not discharge it either -
+a consumer is entitled to skip that peer, and the reference then fails the same two ways. Bundling
+the runtime does not discharge it either; only the type reference matters here. This is the
+declaration-side twin of the optional-peer rule above, and the two fail in opposite directions:
+that one is broken by a _runtime_ import, this one by a _type_ re-export.
+
+[`src/__testing__/publishedTypeSurfaceDependencies.test.ts`](src/__testing__/publishedTypeSurfaceDependencies.test.ts)
+is the guard. It reads the built `dist/index.d.ts` (CI's `node-checks.yml` runs `make build` before
+`make tests`, so it is present; a local `jest` with no build skips, and skipping is itself a failure
+when `CI` is set). It is also the source of truth for the two exemption lists and the per-package
+rationale behind each: packages that leak _undeclared_ (today the redux-facing surface reached
+through `src/actors/*` and `src/redux-persist/*`, whose remedy is its own opt-in entry point, not a
+dependency), and packages that _are_ declared but only as optional peers, whose remedy is to stop
+naming them in the public type surface. Every entry is asserted to still be needed, so it cannot
+outlive its problem - read that file, not a copy here, before touching either list.
+
+Declaring one has a downstream consequence a `devDependency` did not: a real `dependency` takes part
+in the consumer's own dedupe, so installing sistent can lift the consumer's copy of that package to
+satisfy sistent's range. `.github/workflows/test-meshery-integration.yml` pins a Meshery commit for
+exactly this reason, and the pin must be on or after the commit where Meshery UI itself adopted the
+`@meshery/schemas` range sistent declares. Behind an older pin npm resolves one shared copy from the
+newer range, and Meshery UI fails to build on a generated RTK hook that release renamed.
+
+## Permission keys are owned by `meshery/schemas`, not by sistent
+
+sistent consumes the `Key` _interface_ (`id`, `category`, `subcategory`, `function`, `description`)
+from `@meshery/schemas/permissions` and nothing else - it never names a key moniker, never re-exports
+the generated `Keys` / `PermissionKeys` map, and must not acquire a local copy of either. If a key is
+wrong, orphaned, or misspelled, the fix belongs in `meshery/schemas` (and upstream of it, the
+canonical permissions Google Sheet that `build/permissions.csv` is refreshed from), never here.
+
+Worth knowing when triaging a downstream key error: the generated constant _name_ is derived from the
+sheet's human-readable category + function text, while the UUID is stable. Editing that prose - a
+typo fix, a plural made singular - renames the exported constant and orphans the old one. That is how
+`1.3.35 -> 1.3.36` renamed 10 keys with every UUID unchanged, in a patch release.
+
 ## New public exports need an explicit root re-export
 
 `rollup-plugin-dts` (used by tsup for the declaration bundle) silently drops symbols that reach
