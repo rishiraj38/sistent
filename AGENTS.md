@@ -37,7 +37,7 @@ Two complementary guards, and you need both:
 scans `src/` for every load-time form (`import from`, `export ... from`, bare `import`, `require`)
 of an enforced optional peer, and fails `jest` if one appears. `await import()` is deliberately not
 matched - deferring resolution is the fix, not the defect. That file is also the source of truth for
-*which* optional peers are enforced: `react` / `react-dom` are marked optional in `package.json` but
+_which_ optional peers are enforced: `react` / `react-dom` are marked optional in `package.json` but
 exempted there on the record, because every component imports React at module scope and always will.
 
 **2. Built artifact, by hand.** The CI guard reads source, so it cannot speak for what the bundler
@@ -65,6 +65,52 @@ Keep that peer list in step with the enforced set in the test above. Use the
 
 Known live instance: [#1735](https://github.com/layer5io/sistent/issues/1735) (`date-fns` in
 `src/custom/UniversalFilter.tsx`).
+
+## A type in the public API needs a real dependency, not a devDependency
+
+The runtime bundle and the declaration bundle disagree about externals. `tsup` inlines
+`@meshery/schemas` (`noExternal` in `tsup.config.ts`), but `rollup-plugin-dts` still emits
+`export { Key } from '@meshery/schemas/permissions'` into `dist/index.d.ts`. A `devDependency`
+satisfies that reference inside this repo and nowhere else, so the package builds green here and
+then, for a consumer who did not install the package independently:
+
+- `skipLibCheck: false` -> `TS2307: Cannot find module`, pointing at sistent's own `.d.ts`;
+- `skipLibCheck: true` (the common default) -> the re-exported type **silently becomes `any`**.
+
+The silent case is the one that bites. `Key` is the permission-key contract behind `permissionKey`
+on Button/IconButton/MenuItem/ListItem/ListItemButton, `PermissionShield`, `PermissionProvider` and
+`useHasPermission`; when it collapses to `any` those props stop being checked and nothing reports it.
+
+So: **if a package's types reach `dist/index.d.ts`, it must be a `dependency` or `peerDependency`.**
+Bundling the runtime does not discharge that - only the type reference matters here. This is the
+declaration-side twin of the optional-peer rule above, and the two fail in opposite directions:
+that one is broken by a _runtime_ import, this one by a _type_ re-export.
+
+[`src/__testing__/publishedTypeSurfaceDependencies.test.ts`](src/__testing__/publishedTypeSurfaceDependencies.test.ts)
+is the guard. It reads the built `dist/index.d.ts` (CI's `node-checks.yml` runs `make build` before
+`make tests`, so it is present; a local `jest` with no build skips, and skipping is itself a failure
+when `CI` is set). It also owns the exemption list: `@reduxjs/toolkit` and `redux` still leak from
+`src/actors/*` and `src/redux-persist/*`, and today resolve for consumers only because
+`@meshery/schemas` declares `@reduxjs/toolkit` and `react-redux` as required peers - transitive luck,
+not a contract. Neither a plain dependency nor a required peer is right for them (see the rationale
+in that file); the remedy is a separate opt-in entry point for the redux-facing surface.
+
+Related known gap, harmless under `skipLibCheck: true` and untouched: `dist/index.d.ts` names
+`@reduxjs/toolkit/dist/query/react`, an internal path that does not resolve through RTK 2.x's
+`exports` map - `rollup-plugin-dts` rewrote the source's correct `@reduxjs/toolkit/query/react`.
+
+## Permission keys are owned by `meshery/schemas`, not by sistent
+
+sistent consumes the `Key` _interface_ (`id`, `category`, `subcategory`, `function`, `description`)
+from `@meshery/schemas/permissions` and nothing else - it never names a key moniker, never re-exports
+the generated `Keys` / `PermissionKeys` map, and must not acquire a local copy of either. If a key is
+wrong, orphaned, or misspelled, the fix belongs in `meshery/schemas` (and upstream of it, the
+canonical permissions Google Sheet that `build/permissions.csv` is refreshed from), never here.
+
+Worth knowing when triaging a downstream key error: the generated constant _name_ is derived from the
+sheet's human-readable category + function text, while the UUID is stable. Editing that prose - a
+typo fix, a plural made singular - renames the exported constant and orphans the old one. That is how
+`1.3.35 -> 1.3.36` renamed 10 keys with every UUID unchanged, in a patch release.
 
 ## New public exports need an explicit root re-export
 
