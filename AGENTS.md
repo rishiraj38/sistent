@@ -98,6 +98,13 @@ dependency), and packages that _are_ declared but only as optional peers, whose 
 naming them in the public type surface. Every entry is asserted to still be needed, so it cannot
 outlive its problem - read that file, not a copy here, before touching either list.
 
+Declaring one has a downstream consequence a `devDependency` did not: a real `dependency` takes part
+in the consumer's own dedupe, so installing sistent can lift the consumer's copy of that package to
+satisfy sistent's range. `.github/workflows/test-meshery-integration.yml` pins a Meshery commit for
+exactly this reason, and the pin must be on or after the commit where Meshery UI itself adopted the
+`@meshery/schemas` range sistent declares. Behind an older pin npm resolves one shared copy from the
+newer range, and Meshery UI fails to build on a generated RTK hook that release renamed.
+
 ## Permission keys are owned by `meshery/schemas`, not by sistent
 
 sistent consumes the `Key` _interface_ (`id`, `category`, `subcategory`, `function`, `description`)
